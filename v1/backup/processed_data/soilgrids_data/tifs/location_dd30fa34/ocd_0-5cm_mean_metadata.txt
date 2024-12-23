@@ -1,0 +1,10 @@
+Variable: Organic carbon density
+Depth: 0-5cm
+variable_name: Organic carbon densities
+variable_units: hg/dm3
+service_url: https://maps.isric.org/mapserv?map=/map/ocd.map
+service_id: ocd
+coverage_id: ocd_0-5cm_mean
+crs: urn:ogc:def:crs:EPSG::3857
+bounding_box: (-12998916.604526507, 7761018.216761842, -12978916.604526507, 7781018.216761842)
+grid_res: [250, 250]

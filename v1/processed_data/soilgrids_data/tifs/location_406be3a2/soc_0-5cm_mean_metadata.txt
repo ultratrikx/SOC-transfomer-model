@@ -1,0 +1,10 @@
+Variable: Soil organic carbon content
+Depth: 0-5cm
+variable_name: Soil organic carbon content
+variable_units: dg/kg
+service_url: https://maps.isric.org/mapserv?map=/map/soc.map
+service_id: soc
+coverage_id: soc_0-5cm_mean
+crs: urn:ogc:def:crs:EPSG::3857
+bounding_box: (-13413304.711442512, 7620992.651217308, -13393304.711442512, 7640992.651217308)
+grid_res: [250, 250]
