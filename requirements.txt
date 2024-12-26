@@ -14,3 +14,4 @@ torchvision
 timm
 scikit-learn
 pillow
+earthengine-api
