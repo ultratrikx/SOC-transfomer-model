@@ -1,9 +1,11 @@
 pandas
+geopandas
 numpy
 matplotlib
 rasterio
 OWSlib
 pyproj
+shapely
 soilgrids
 requests
 tqdm
@@ -15,3 +17,7 @@ timm
 scikit-learn
 pillow
 earthengine-api
+seaborn
+contextily
+rtree
+fiona
