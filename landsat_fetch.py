@@ -16,6 +16,11 @@ from urllib3.util.retry import Retry
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from data_manager import DataManager
+import rasterio
+import numpy as np
+from ee.ee_exception import EEException
+import logging
+import sys
 
 
 
@@ -29,169 +34,269 @@ class GEELandsatFetcher:
     def __init__(self, data_manager):
         self.data_manager = data_manager
         self.output_dir = self.data_manager.landsat_dir
-        self.csv_path = self.data_manager.get_csv_path("north_american_forests.csv")
-        self.pixel_size = 128
-        self.required_columns = ['latitude', 'longitude']
         self.scale = 30  # Landsat resolution in meters
-        self.region_size = 3840  # 128 pixels * 30m = 3840m
-        self.years = range(2015, 2021)  # 2015-2020
-        self.summer_months = ['06', '07', '08']  # June, July, August
-        self.winter_months = ['01', '02', '12']  # December, January, February
+        self.years = range(2015, 2019)  # 2015-2020
+        self.max_cloud_cover = 30  # Increased from 20
+        self.max_snow_cover = 20   # Increased from 10
         
+        # Create seasonal directories
+        self.summer_dir = os.path.join(self.output_dir, 'summer')
+        self.winter_dir = os.path.join(self.output_dir, 'winter')
+        os.makedirs(self.summer_dir, exist_ok=True)
+        os.makedirs(self.winter_dir, exist_ok=True)
+        self.max_retries = 3
+        self.retry_delay = 5  # seconds
+        self.crs = None
+        self.target_pixels = 64  # Target size in pixels
+        self.target_size = 16000  # Target size in meters (16km)
+        self.target_resolution = self.target_size / self.target_pixels  # 250m per pixel
+        self.collection_timeout = 30  # seconds timeout for collection queries
+        self.max_retries = 3
+        self.retry_delay = 5
+
+        self.logger = logging.getLogger("GEELandsatFetcher")
+        self.logger.setLevel(logging.INFO)
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
+        formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+        ch.setFormatter(formatter)
+        self.logger.addHandler(ch)
+
+        self.failed_files = []
+
     def get_ndvi(self, image):
         """Calculate NDVI from Landsat 8 bands"""
         nir = image.select('SR_B5')
         red = image.select('SR_B4')
         return nir.subtract(red).divide(nir.add(red)).rename('NDVI')
     
+    def get_ndwi(self, image):
+        """Calculate NDWI from Landsat 8 bands"""
+        nir = image.select('SR_B5')
+        green = image.select('SR_B3')
+        return green.subtract(nir).divide(green.add(nir)).rename('NDWI')
+
+    def get_geotiff_bounds(self, geotiff_path):
+        """Get the bounds and CRS of a GeoTIFF file"""
+        with rasterio.open(geotiff_path) as src:
+            bounds = src.bounds
+            # Store the CRS from the first GeoTIFF if not already set
+            if not self.crs:
+                self.crs = self.data_manager.get_reference_crs(geotiff_path)
+            
+            # Add padding to ensure complete coverage
+            width = bounds.right - bounds.left
+            height = bounds.top - bounds.bottom
+            padding_x = width * 0.2
+            padding_y = height * 0.2
+            
+            return {
+                'left': bounds.left - padding_x,
+                'right': bounds.right + padding_x,
+                'top': bounds.top + padding_y,
+                'bottom': bounds.bottom - padding_y
+            }
+
+    def create_region_from_geotiff(self, bounds):
+        """Create a region from GeoTIFF bounds"""
+        coords = [
+            [bounds['left'], bounds['bottom']],
+            [bounds['left'], bounds['top']],
+            [bounds['right'], bounds['top']],
+            [bounds['right'], bounds['bottom']],
+            [bounds['left'], bounds['bottom']]
+        ]
+        return ee.Geometry.Polygon([coords])
+
+    def get_collection_size_with_timeout(self, collection):
+        """Get collection size with timeout"""
+        try:
+            size = collection.size().getInfo()
+            return size if size is not None else 0
+        except EEException as e:
+            print(f"Earth Engine error: {str(e)}")
+            return 0
+        except Exception as e:
+            print(f"Error getting collection size: {str(e)}")
+            return 0
+
     def get_seasonal_collection(self, season, year, region):
         """Get filtered collection for a specific season and year"""
-        if season == 'summer':
-            start_date = f'{year}-06-01'
-            end_date = f'{year}-08-31'
-        else:  # winter
-            # Include December of previous year
-            winter_start = f'{year-1}-12-01'
-            winter_end = f'{year}-02-28'
-            
-        collection = (ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
-                     .filterBounds(region)
-                     .filter(ee.Filter.lt('CLOUD_COVER', 20))
-                     # Filter out snow/ice
-                     .filter(ee.Filter.lt('SNOW_ICE_COVER_PERCENT', 10)))
-        
-        if season == 'summer':
-            # Get summer collection and sort by NDVI (descending)
-            summer_collection = collection.filterDate(start_date, end_date)
-            with_ndvi = summer_collection.map(lambda img: img.addBands(self.get_ndvi(img)))
-            return with_ndvi.sort('NDVI', False)  # Highest NDVI first
-        else:
-            # Get winter collection and sort by NDVI (ascending)
-            winter_collection = collection.filterDate(winter_start, winter_end)
-            with_ndvi = winter_collection.map(lambda img: img.addBands(self.get_ndvi(img)))
-            return with_ndvi.sort('NDVI', True)  # Lowest NDVI first
-    
-    def create_region(self, lat, lon):
-        """Create a square region centered on the point"""
-        point = ee.Geometry.Point([lon, lat])
-        return point.buffer(self.region_size/2, 1).bounds()
+        try:
+            if (season == 'summer'):
+                start_date = f'{year}-06-01'
+                end_date = f'{year}-09-30'
+                dates = [(start_date, end_date)]
+            else:
+                dates = [
+                    (f'{year-1}-12-01', f'{year}-02-28'),  # Winter
+                    (f'{year}-03-01', f'{year}-05-31'),    # Spring
+                ]
+                
+            # Initial collection with strict filters
+            filtered_collection = None
+            for start_date, end_date in dates:
+                collection = (ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+                            .filterBounds(region)
+                            .filterDate(start_date, end_date)
+                            .filter(ee.Filter.lt('CLOUD_COVER', self.max_cloud_cover)))
+                
+                size = self.get_collection_size_with_timeout(collection)
+                if size > 0:
+                    if filtered_collection is None:
+                        filtered_collection = collection
+                    else:
+                        filtered_collection = filtered_collection.merge(collection)
 
-    def fetch_landsat_data(self, lat, lon, location_id):
-        """Fetch summer and winter images for each year"""
-        region = self.create_region(lat, lon)
-        metadata = []
+            # If no images found, try relaxed filters
+            if filtered_collection is None or self.get_collection_size_with_timeout(filtered_collection) == 0:
+                print(f"No {season} images found for {year}, trying with relaxed filters")
+                filtered_collection = None
+                for start_date, end_date in dates:
+                    collection = (ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+                                .filterBounds(region)
+                                .filterDate(start_date, end_date)
+                                .filter(ee.Filter.lt('CLOUD_COVER', 50)))
+                    
+                    size = self.get_collection_size_with_timeout(collection)
+                    if size > 0:
+                        if filtered_collection is None:
+                            filtered_collection = collection
+                        else:
+                            filtered_collection = filtered_collection.merge(collection)
+
+            if filtered_collection is None or self.get_collection_size_with_timeout(filtered_collection) == 0:
+                print(f"No images found for {season} {year}")
+                return None
+
+            size = self.get_collection_size_with_timeout(filtered_collection)
+            print(f"Found {size} images for {season} {year}")
+            
+            with_ndvi = filtered_collection.map(lambda img: img.addBands(self.get_ndvi(img)))
+            return with_ndvi.sort('NDVI', False if season == 'summer' else True)
+
+        except Exception as e:
+            print(f"Error processing {season} {year}: {str(e)}")
+            return None
+
+    def fetch_landsat_for_geotiff(self, geotiff_path):
+        """Fetch Landsat data for a specific GeoTIFF region"""
+        bounds = self.get_geotiff_bounds(geotiff_path)
+        region = self.create_region_from_geotiff(bounds)
+        image_id = os.path.splitext(os.path.basename(geotiff_path))[0]
         
         for year in self.years:
-            print(f"\nProcessing year {year} for location {location_id}")
+            print(f"\nProcessing year {year} for {image_id}")
             
-            # Get summer image (highest vegetation)
-            summer_collection = self.get_seasonal_collection('summer', year, region)
-            summer_image = summer_collection.first()
-            
-            # Get winter image (lowest vegetation)
-            winter_collection = self.get_seasonal_collection('winter', year, region)
-            winter_image = winter_collection.first()
-            
-            # If no suitable winter image, use second-best summer image
-            if winter_image is None:
-                print(f"No suitable winter image for {year}, using alternative summer image")
-                winter_image = summer_collection.sort('NDVI', True).first()
-            
-            # Process both seasonal images
-            for season, image in [('summer', summer_image), ('winter', winter_image)]:
-                if image is not None:
-                    scene_id = image.get('LANDSAT_SCENE_ID').getInfo()
-                    cloud_cover = image.get('CLOUD_COVER').getInfo()
-                    ndvi = image.select('NDVI').reduceRegion(
-                        reducer=ee.Reducer.mean(),
-                        geometry=region,
-                        scale=30
-                    ).get('NDVI').getInfo()
+            for season, output_dir in [('summer', self.summer_dir), ('winter', self.winter_dir)]:
+                collection = self.get_seasonal_collection(season, year, region)
+                if collection is None:
+                    continue
+                
+                image = collection.first()
+                if image is None:
+                    print(f"No valid image found for {season} {year}")
+                    continue
+
+                try:
+                    # Validate image before processing
+                    band_names = image.bandNames().getInfo()
+                    if not band_names:
+                        print(f"Invalid image for {season} {year}: No bands available")
+                        continue
+
+                    # Create season-specific subfolder
+                    season_year_dir = os.path.join(output_dir, f'{year}')
+                    os.makedirs(season_year_dir, exist_ok=True)
                     
-                    print(f"Processing {season} image for {year} (Cloud: {cloud_cover}%, NDVI: {ndvi:.2f})")
-                    
-                    # Download each band
-                    sr_bands = ['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7']
-                    
-                    for band in sr_bands:
-                        output_path = self.data_manager.get_landsat_path(location_id, scene_id, band)
-                        
-                        if not os.path.exists(output_path):
-                            # Select and clip the band
-                            band_image = image.select(band).clip(region)
-                            
-                            # Get the download URL with correct parameters
-                            url = band_image.getDownloadURL({
-                                'region': region,
-                                'scale': self.scale,
-                                'format': 'GEO_TIFF',
-                            })
-                            
-                            # Download the file
-                            response = requests.get(url)
-                            with open(output_path, 'wb') as f:
-                                f.write(response.content)
-                            print(f"Downloaded {band} for location {location_id}")
-                    
-                    # Update metadata
-                    metadata.append({
-                        'location_id': location_id,
-                        'latitude': lat,
-                        'longitude': lon,
-                        'scene_id': scene_id,
-                        'season': season,
-                        'year': year,
-                        'cloud_cover': cloud_cover,
-                        'ndvi': ndvi,
-                        'timestamp': datetime.datetime.now().isoformat()
-                    })
+                    # Process bands with retry mechanism
+                    for retry in range(self.max_retries):
+                        try:
+                            self._process_bands(image, image_id, season_year_dir, region)
+                            break
+                        except Exception as e:
+                            if retry == self.max_retries - 1:
+                                print(f"Failed to process {image_id} after {self.max_retries} attempts: {str(e)}")
+                            else:
+                                print(f"Retry {retry + 1}/{self.max_retries} for {image_id}")
+                                time.sleep(self.retry_delay)
+                                
+                except Exception as e:
+                    print(f"Error processing {image_id} for {season} {year}: {str(e)}")
+                    continue
+
+    def _process_bands(self, image, image_id, output_dir, region):
+        """Process and download all bands for an image"""
+        bands_to_download = {
+            'SR_B1': 'B1', 'SR_B2': 'B2', 'SR_B3': 'B3',
+            'SR_B4': 'B4', 'SR_B5': 'B5'
+        }
         
-        # Update metadata CSV
-        self.update_metadata(metadata)
-        return metadata
-
-    def update_metadata(self, metadata):
-        df = pd.DataFrame(metadata)
-        if os.path.exists(self.csv_path):
-            existing_df = pd.read_csv(self.csv_path)
-            df = pd.concat([existing_df, df], ignore_index=True)
+        # Add indices
+        image = image.addBands(self.get_ndvi(image))
+        image = image.addBands(self.get_ndwi(image))
+        bands_to_download.update({'NDVI': 'NDVI', 'NDWI': 'NDWI'})
         
-        df.to_csv(self.csv_path, index=False)
+        for band, band_name in bands_to_download.items():
+            output_path = os.path.join(output_dir, f'{image_id}_{band_name}.tif')
+            if not os.path.exists(output_path):
+                band_image = image.select(band).clip(region)
 
-    def process_coordinates(self, coordinates_df):
-        """Process coordinates with automatic location ID generation if needed"""
-        # Validate required columns
-        if not all(col in coordinates_df.columns for col in self.required_columns):
-            raise ValueError(f"CSV must contain columns: {self.required_columns}")
-        
-        # Add location_id if not present
-        if 'location_id' not in coordinates_df.columns:
-            coordinates_df['location_id'] = [f'loc_{i:04d}' for i in range(len(coordinates_df))]
+                url = band_image.getDownloadURL({
+                    'region': region,
+                    'dimensions': [self.target_pixels, self.target_pixels],
+                    'format': 'GEO_TIFF',
+                    'crs': str(self.crs),
+                })
+                
+                response = requests.get(url)
+                with open(output_path, 'wb') as f:
+                    f.write(response.content)
+                
+                # Verify dimensions
+                with rasterio.open(output_path) as src:
+                    if src.shape != (self.target_pixels, self.target_pixels):
+                        print(f"Warning: Dimension mismatch for {band_name}. "
+                              f"Expected {(self.target_pixels, self.target_pixels)}, got {src.shape}")
+                    if str(src.crs) != str(self.crs):
+                        print(f"Warning: CRS mismatch for {band_name}. Expected {self.crs}, got {src.crs}")
+                
+                print(f"Downloaded {band_name} for {image_id}")
+
+    def process_geotiffs(self, geotiff_dir):
+        """Process all GeoTIFF files in a directory"""
+        try:
+            # Get CRS from first GeoTIFF
+            first_tiff = next(f for f in os.listdir(geotiff_dir) if f.endswith('.tif'))
+            first_tiff_path = os.path.join(geotiff_dir, first_tiff)
+            self.crs = self.data_manager.get_reference_crs(first_tiff_path)
+            print(f"Using CRS from reference GeoTIFF: {self.crs}")
             
-            # Save the updated DataFrame with location IDs
-            coordinates_df.to_csv(self.csv_path, index=False)
-            print(f"Added location IDs and saved to {self.csv_path}")
+            # Process all GeoTIFFs
+            for file in os.listdir(geotiff_dir):
+                if file.endswith('.tif'):
+                    geotiff_path = os.path.join(geotiff_dir, file)
+                    self.logger.info(f"Processing file: {file}")
+                    try:
+                        print(f"\nProcessing file: {file}")
+                        self.fetch_landsat_for_geotiff(geotiff_path)
+                    except Exception as e:
+                        self.logger.error(f"Error processing {file}: {str(e)}")
+                        self.failed_files.append(file)
+                        print(f"Error processing {file}: {str(e)}")
+                        print("Continuing with next file...")
+                        continue
+            self.logger.info(f"Failed files: {self.failed_files}")
+                    
+        except Exception as e:
+            print(f"Fatal error in process_geotiffs: {str(e)}")
+            raise
 
-        for _, row in coordinates_df.iterrows():
-            try:
-                self.fetch_landsat_data(
-                    float(row['latitude']),
-                    float(row['longitude']),
-                    str(row['location_id'])
-                )
-            except Exception as e:
-                print(f"Error processing location {row['location_id']}: {str(e)}")
-                continue
-
-
-# Initialize DataManager before GEELandsatFetcher
-data_manager = DataManager(base_dir="data")
-fetcher = GEELandsatFetcher(data_manager)
-
-# Load and validate coordinates
-try:
-    coordinates_df = pd.read_csv(data_manager.get_csv_path("north_american_forests.csv"))
-    print(f"Loaded {len(coordinates_df)} coordinates")
-    fetcher.process_coordinates(coordinates_df)
-except Exception as e:
-    print(f"Error: {str(e)}")
+# Initialize and run
+if __name__ == "__main__":
+    data_manager = DataManager(base_dir="data")
+    fetcher = GEELandsatFetcher(data_manager)
+    
+    # Specify your GeoTIFF directory
+    geotiff_dir = "./data/SOC/2016_1m"
+    fetcher.process_geotiffs(geotiff_dir)
