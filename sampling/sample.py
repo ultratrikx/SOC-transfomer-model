@@ -1,82 +1,51 @@
 import geopandas as gpd
 import pandas as pd
-import rasterio
-from rasterio.transform import from_origin
-from shapely.geometry import box
+from shapely.geometry import Point
 import numpy as np
-import os
 
 # Step 1: Load Shapefile
 shapefile_path = './canada_peats/Canada_Peatland.shp'
+peatlands = gpd.read_file(shapefile_path)
 
-# Set CRS explicitly to WGS84
-crs = 'EPSG:4326'
-peatlands = gpd.read_file(shapefile_path).to_crs(crs)
+# Ensure CRS is in meters for accurate distance calculations
+peatlands = peatlands.to_crs(epsg=3347)  # Example CRS: NAD83 / Canada LCC (Adjust if needed)
+print(f"Loaded {len(peatlands)} peatland polygons from '{shapefile_path}'")
+print(f"CRS: {peatlands.crs}")
+print(f"Bounds: {peatlands.total_bounds}")
+print(f"Columns: {peatlands.columns}")
+print(f"Sample Data: {peatlands.head()}")
+print(f"Sample Geometry: {peatlands.geometry.head()}")
+print(f"Sample Area: {peatlands.area.head()}")
+print(f"Sample Perimeter: {peatlands.length.head()}")
+print(f"Sample Centroid: {peatlands.centroid.head()}")
+print(f"Sample Convex Hull: {peatlands.convex_hull.head()}")
+print(f"Sample Envelope: {peatlands.envelope.head()}")
+print(f"Sample Boundary: {peatlands.boundary.head()}")
+print(f"Sample Buffer: {peatlands.buffer(1000).head()}")
 
-# Step 2: Filter Peatlands by Threshold
-threshold = 40   # Example threshold for peatland percentage
-filtered_peatlands = peatlands[peatlands['PEAT_PER'] > threshold]
+# Step 2: Create a Grid of Points ~750m Apart
+minx, miny, maxx, maxy = peatlands.total_bounds
+x_coords = np.arange(minx, maxx, 25000)
+y_coords = np.arange(miny, maxy, 25000)
+print(f"Creating grid of {len(x_coords) * len(y_coords)} points...")
+print(f"X Coordinates: {x_coords[:5]}...{x_coords[-5:]}")
+print(f"Y Coordinates: {y_coords[:5]}...{y_coords[-5:]}")
 
-#Output the number of identified features
-num_features = len(filtered_peatlands)
-print(f"Number of identified features above threshold ({threshold}%): {num_features}")
 
-# Step 3: Create a 750m x 750m Grid
-minx, miny, maxx, maxy = filtered_peatlands.total_bounds
-x_coords = np.arange(minx, maxx, 0.01)  # Approximate grid size in degrees
-y_coords = np.arange(miny, maxy, 0.01)
-grid_cells = []
+# Generate Points on the Grid
+points = [Point(x, y) for x in x_coords for y in y_coords]
+print(f"Generated {len(points)} points")
+grid_points = gpd.GeoDataFrame(geometry=points, crs=peatlands.crs)
+print(f"Sample Grid Points: {grid_points.head()}")
 
-for x in x_coords:
-    for y in y_coords:
-        grid_cells.append(box(x, y, x + 0.01, y + 0.01))
+# Step 3: Clip Points to Peatland Area
+spatially_diverse_points = gpd.sjoin(grid_points, peatlands, how='inner', predicate='within')
 
-grid = gpd.GeoDataFrame({'geometry': grid_cells}, crs=filtered_peatlands.crs)
+# Step 4: Save Points to CSV
+spatially_diverse_points.to_crs(epsg=4326)  # Convert back to Lat/Lon for CSV export
+spatially_diverse_points['lon'] = spatially_diverse_points.geometry.x
+spatially_diverse_points['lat'] = spatially_diverse_points.geometry.y
 
-# Step 4: Clip Grid to Filtered Peatlands
-training_data = gpd.overlay(grid, filtered_peatlands, how='intersection')
+spatially_diverse_points[['lon', 'lat']].to_csv('spatially_diverse_points_25000.csv', index=False)
 
-# Step 5: Export Separate GeoTIFF for Each Feature
-output_folder = 'peatland_tiffs'
-os.makedirs(output_folder, exist_ok=True)
-resolution = 0.01
-
-csv_rows = []
-
-for index, cell in training_data.iterrows():
-    feature_tiff = os.path.join(output_folder, f'peatland_feature_{index}.tif')
-    minx, miny, maxx, maxy = cell.geometry.bounds
-    transform = from_origin(minx, maxy, resolution, resolution)
-    width = int((maxx - minx) / resolution)
-    height = int((maxy - miny) / resolution)
-    
-    with rasterio.open(
-        feature_tiff,
-        'w',
-        driver='GTiff',
-        height=height,
-        width=width,
-        count=1,
-        dtype='float32',
-        crs=filtered_peatlands.crs,
-        transform=transform
-    ) as dst:
-        raster_data = np.ones((height, width), dtype='float32')
-        dst.write(raster_data, 1)
-    
-    csv_rows.append({
-        'feature_id': index,
-        'minx': minx,
-        'miny': miny,
-        'maxx': maxx,
-        'maxy': maxy,
-        'tiff_file': feature_tiff
-    })
-
-# Step 6: Export CSV
-csv_output = 'peatland_training_data.csv'
-csv_df = pd.DataFrame(csv_rows)
-csv_df.to_csv(csv_output, index=False)
-
-print(f"GeoTIFF files saved in '{output_folder}'")
-print(f"CSV saved as '{csv_output}'")
+print(f"{len(spatially_diverse_points)} spatially diverse points saved to 'spatially_diverse_points.csv'")

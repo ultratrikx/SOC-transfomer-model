@@ -21,3 +21,4 @@ seaborn
 contextily
 rtree
 fiona
+folium
