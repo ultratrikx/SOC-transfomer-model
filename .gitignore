@@ -1,14 +1,9 @@
-/misc/landsat_images
-/misc/2landsat_images
-/misc/2processed_data
 /venv
 /.ipynb_checkpoints
-/processed_data
 /__pycache__
-/backup
-/data/csv/unused_sample
+.vscode
+/csv/unused_sample
 /data/SOC/2016_SOC-1.tif
 /data/SOC/2016_SOC-30.tif
 /data/SOC/1980_0-5_SOC.tif
 /data/SOC/1980_5-15_SOC.tif
-.vscode
